@@ -1,0 +1,154 @@
+services:
+  postgres-auth:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: auth
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: auth_db
+    volumes:
+      - postgres-auth-data:/var/lib/postgresql/data
+    networks:
+      - taskmanager-net
+
+  postgres-task:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: task
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: task_db
+    volumes:
+      - postgres-task-data:/var/lib/postgresql/data
+    networks:
+      - taskmanager-net
+
+  postgres-reporting:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: reporting
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: reporting_db
+    volumes:
+      - postgres-reporting-data:/var/lib/postgresql/data
+    networks:
+      - taskmanager-net
+
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    ports:
+      - "15672:15672" # management UI: http://localhost:15672 (guest/guest)
+    networks:
+      - taskmanager-net
+
+  auth-service:
+    build: ./auth-service
+    environment:
+      PORT: 4001
+      DATABASE_URL: postgres://auth:${POSTGRES_PASSWORD}@postgres-auth:5432/auth_db
+      JWT_SECRET: ${JWT_SECRET}
+    depends_on:
+      - postgres-auth
+    networks:
+      - taskmanager-net
+
+  task-service:
+    build: ./task-service
+    environment:
+      PORT: 4002
+      DATABASE_URL: postgres://task:${POSTGRES_PASSWORD}@postgres-task:5432/task_db
+      JWT_SECRET: ${JWT_SECRET}
+      RABBITMQ_URL: ${RABBITMQ_URL:-amqp://rabbitmq}
+      RABBITMQ_EXCHANGE: ${RABBITMQ_EXCHANGE:-task_events}
+      DEADLINE_WARNING_MINUTES: ${DEADLINE_WARNING_MINUTES:-60}
+      DEADLINE_CHECK_INTERVAL_MS: ${DEADLINE_CHECK_INTERVAL_MS:-30000}
+    depends_on:
+      - postgres-task
+      - rabbitmq
+    networks:
+      - taskmanager-net
+
+  notification-service:
+    build: ./notification-service
+    environment:
+      RABBITMQ_URL: ${RABBITMQ_URL:-amqp://rabbitmq}
+      RABBITMQ_EXCHANGE: ${RABBITMQ_EXCHANGE:-task_events}
+      RABBITMQ_DLX_EXCHANGE: ${RABBITMQ_DLX_EXCHANGE:-task_events.dlx}
+    depends_on:
+      - rabbitmq
+    networks:
+      - taskmanager-net
+
+  reporting-service:
+    build: ./reporting-service
+    environment:
+      POSTGRES_DB: reporting_db
+      POSTGRES_USER: reporting
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_HOST: postgres-reporting
+      DJANGO_SECRET_KEY: ${DJANGO_SECRET_KEY}
+      RABBITMQ_URL: ${RABBITMQ_URL:-amqp://rabbitmq}
+      RABBITMQ_EXCHANGE: ${RABBITMQ_EXCHANGE:-task_events}
+      RABBITMQ_DLX_EXCHANGE: ${RABBITMQ_DLX_EXCHANGE:-task_events.dlx}
+    command: sh -c "python manage.py migrate && gunicorn reporting.wsgi:application --bind 0.0.0.0:4004"
+    depends_on:
+      - postgres-reporting
+      - rabbitmq
+    networks:
+      - taskmanager-net
+
+  reporting-consumer:
+    build: ./reporting-service
+    environment:
+      POSTGRES_DB: reporting_db
+      POSTGRES_USER: reporting
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_HOST: postgres-reporting
+      DJANGO_SECRET_KEY: ${DJANGO_SECRET_KEY}
+      RABBITMQ_URL: ${RABBITMQ_URL:-amqp://rabbitmq}
+      RABBITMQ_EXCHANGE: ${RABBITMQ_EXCHANGE:-task_events}
+      RABBITMQ_DLX_EXCHANGE: ${RABBITMQ_DLX_EXCHANGE:-task_events.dlx}
+    command: sh -c "python manage.py migrate && python manage.py consume_events"
+    depends_on:
+      - postgres-reporting
+      - rabbitmq
+    networks:
+      - taskmanager-net
+
+  api-gateway:
+    build: ./api-gateway
+    ports:
+      - "4000:4000"
+    environment:
+      PORT: 4000
+      AUTH_SERVICE_URL: http://auth-service:4001
+      TASK_SERVICE_URL: http://task-service:4002
+      REPORTING_SERVICE_URL: http://reporting-service:4004
+      WEB_UI_ORIGIN: ${WEB_UI_ORIGIN:-http://localhost:3000}
+    depends_on:
+      - auth-service
+      - task-service
+      - reporting-service
+    networks:
+      - taskmanager-net
+
+  web-ui:
+    build:
+      context: ./web-ui
+      args:
+        VITE_API_BASE_URL: ${VITE_API_BASE_URL:-http://localhost:4000}
+    ports:
+      - "3000:3000"
+    environment:
+      PORT: 3000
+    depends_on:
+      - api-gateway
+    networks:
+      - taskmanager-net
+
+volumes:
+  postgres-auth-data:
+  postgres-task-data:
+  postgres-reporting-data:
+
+networks:
+  taskmanager-net:
+    driver: bridge
